@@ -3,19 +3,21 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	tele "gopkg.in/telebot.v4"
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "OK")
 	})
-
-	log.Fatal(http.ListenAndServe(":3000", nil))
 
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
@@ -32,5 +34,24 @@ func main() {
 		return c.Send("Hello!")
 	})
 
-	b.Start()
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		logger.Info("Starting HTTP server")
+		log.Fatal(http.ListenAndServe(":3000", nil))
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		logger.Info("Starting Telegram bot")
+		b.Start()
+	}()
+
+	wg.Wait()
+
+	fmt.Println("a vse")
 }
