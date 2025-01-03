@@ -24,19 +24,26 @@ func (id ResendTarget) Recipient() string {
 
 type Source struct {
 	Type string `koanf:"type" validate:"required,oneof='channel' 'group'"`
-	Id   int64 `koanf:"id" validate:"required"`
+	Id   int64  `koanf:"id" validate:"required"`
+}
+
+type Command struct {
+	Text        string `koanf:"text" validate:"required_if=Enabled true"`
+	Description string `koanf:"description" validate:"required_if=Enabled true"`
 }
 
 type Config struct {
 	Token  string `koanf:"token" validate:"required,len=46"`
 	Resend struct {
-		Enabled bool   `koanf:"enabled"`
-		From    Source `koanf:"from" validate:"required_if=Enabled true"`
-		To      Source `koanf:"to" validate:"required_if=Enabled true"`
+		Enabled bool    `koanf:"enabled"`
+		Command Command `koanf:"command" validate:"required_if=Enabled true"`
+		From    Source  `koanf:"from" validate:"required_if=Enabled true"`
+		To      Source  `koanf:"to" validate:"required_if=Enabled true"`
 	} `koanf:"resend"`
 	Feedback struct {
-		Enabled bool   `koanf:"enabled"`
-		ChatId  string `koanf:"chatId" validate:"required_if=Enabled true"`
+		Enabled bool    `koanf:"enabled"`
+		Command Command `koanf:"command" validate:"required_if=Enabled true"`
+		ChatId  string  `koanf:"chatId" validate:"required_if=Enabled true"`
 	} `koanf:"feedback"`
 }
 
@@ -82,10 +89,17 @@ func main() {
 		panic(err)
 	}
 
-	b.Handle("/id", func (c tele.Context) error {
+	var botCommands []tele.Command
+
+	b.Handle("/id", func(c tele.Context) error {
 		id := strconv.Itoa(int(c.Chat().ID))
 		log.Println("Got /id", id)
 		return c.Send(strconv.Itoa(int(c.Chat().ID)))
+	})
+
+	botCommands = append(botCommands, tele.Command{
+		Text:        "/id",
+		Description: "Get ID of this chat",
 	})
 
 	if config.Resend.Enabled {
@@ -93,18 +107,26 @@ func main() {
 
 		target := ResendTarget(strconv.Itoa(int(config.Resend.To.Id)))
 
-		b.Handle("/forward", func(c tele.Context) error {
-			log.Println("Got /forward", c.Chat().ID)
+		b.Handle(config.Resend.Command.Text, func(c tele.Context) error {
+			log.Println("Got resend", c.Chat().ID)
 
 			if c.Message().IsReply() && c.Chat().ID == config.Resend.From.Id {
+				log.Println("Resend", c.Chat().ID, target)
 				_, err := b.Forward(target, c.Message().ReplyTo)
 				return err
 			}
 			return nil
 		})
+
+		botCommands = append(botCommands, tele.Command{
+			Text:        config.Resend.Command.Text,
+			Description: config.Resend.Command.Description,
+		})
 	}
 
-	b.SetCommands()
+	if err := b.SetCommands(botCommands); err != nil {
+		log.Fatal(err)
+	}
 
 	// Starting the app
 	wg := sync.WaitGroup{}
