@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -101,30 +102,28 @@ func main() {
 	if config.Resend.Enabled {
 		log.Println("Enabling resend functionality")
 
-		for _, fromId := range config.Resend.From {
-			resendHandler := func(c tele.Context) error {
-				log.Println("Got resend", c.Chat().ID)
+		resendHandler := func(c tele.Context) error {
+			log.Println("Got resend", c.Chat().ID)
 
-				if c.Message().IsReply() && c.Chat().ID == fromId {
-					for _, toId := range config.Resend.To {
-						target := ResendTarget(strconv.Itoa(int(toId)))
-						log.Println("Resend", c.Chat().ID, target)
+			if c.Message().IsReply() && slices.Contains(config.Resend.From, c.Chat().ID) {
+				for _, toId := range config.Resend.To {
+					target := ResendTarget(strconv.Itoa(int(toId)))
+					log.Println("Resend", c.Chat().ID, target)
 
-						if _, err := b.Forward(target, c.Message().ReplyTo); err != nil {
-							log.Println("Error during resend", err)
-						}
+					if _, err := b.Forward(target, c.Message().ReplyTo); err != nil {
+						log.Println("Error during resend", err)
 					}
 				}
-				return nil
 			}
+			return nil
+		}
 
-			// Listen to the registered command
-			b.Handle(config.Resend.Command.Text, resendHandler)
+		// Listen to the registered command
+		b.Handle(config.Resend.Command.Text, resendHandler)
 
-			// Listen to the keywords
-			for _, keyword := range config.Resend.Keywords {
-				b.Handle(keyword, resendHandler)
-			}
+		// Listen to the keywords
+		for _, keyword := range config.Resend.Keywords {
+			b.Handle(keyword, resendHandler)
 		}
 
 		botCommands = append(botCommands, tele.Command{
