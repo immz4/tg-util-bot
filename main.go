@@ -22,11 +22,6 @@ func (id ResendTarget) Recipient() string {
 	return string(id)
 }
 
-type Source struct {
-	Type string `koanf:"type" validate:"required,oneof='channel' 'group'"`
-	Id   int64  `koanf:"id" validate:"required"`
-}
-
 type Command struct {
 	Text        string `koanf:"text" validate:"required_if=Enabled true"`
 	Description string `koanf:"description" validate:"required_if=Enabled true"`
@@ -35,10 +30,11 @@ type Command struct {
 type Config struct {
 	Token  string `koanf:"token" validate:"required,len=46"`
 	Resend struct {
-		Enabled bool    `koanf:"enabled"`
-		Command Command `koanf:"command" validate:"required_if=Enabled true"`
-		From    Source  `koanf:"from" validate:"required_if=Enabled true"`
-		To      Source  `koanf:"to" validate:"required_if=Enabled true"`
+		Enabled  bool     `koanf:"enabled"`
+		Command  Command  `koanf:"command" validate:"required_if=Enabled true"`
+		Keywords []string `koanf:"keywords"`
+		From     []int64  `koanf:"from" validate:"required_if=Enabled true"`
+		To       []int64  `koanf:"to" validate:"required_if=Enabled true"`
 	} `koanf:"resend"`
 	Feedback struct {
 		Enabled bool    `koanf:"enabled"`
@@ -105,18 +101,31 @@ func main() {
 	if config.Resend.Enabled {
 		log.Println("Enabling resend functionality")
 
-		target := ResendTarget(strconv.Itoa(int(config.Resend.To.Id)))
+		for _, fromId := range config.Resend.From {
+			resendHandler := func(c tele.Context) error {
+				log.Println("Got resend", c.Chat().ID)
 
-		b.Handle(config.Resend.Command.Text, func(c tele.Context) error {
-			log.Println("Got resend", c.Chat().ID)
+				if c.Message().IsReply() && c.Chat().ID == fromId {
+					for _, toId := range config.Resend.To {
+						target := ResendTarget(strconv.Itoa(int(toId)))
+						log.Println("Resend", c.Chat().ID, target)
 
-			if c.Message().IsReply() && c.Chat().ID == config.Resend.From.Id {
-				log.Println("Resend", c.Chat().ID, target)
-				_, err := b.Forward(target, c.Message().ReplyTo)
-				return err
+						if _, err := b.Forward(target, c.Message().ReplyTo); err != nil {
+							log.Println("Error during resend", err)
+						}
+					}
+				}
+				return nil
 			}
-			return nil
-		})
+
+			// Listen to the registered command
+			b.Handle(config.Resend.Command.Text, resendHandler)
+
+			// Listen to the keywords
+			for _, keyword := range config.Resend.Keywords {
+				b.Handle(keyword, resendHandler)
+			}
+		}
 
 		botCommands = append(botCommands, tele.Command{
 			Text:        config.Resend.Command.Text,
