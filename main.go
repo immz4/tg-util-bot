@@ -134,7 +134,7 @@ func main() {
 	if config.Feedback.Enabled {
 		log.Println("Enabling feedback functionality")
 
-		b.Handle(tele.OnText, func(c tele.Context) error {
+		forwardHandler := func(c tele.Context) error {
 			if c.Chat().Type == tele.ChatPrivate {
 				for _, toId := range config.Feedback.To {
 					target := ResendTarget(strconv.Itoa(int(toId)))
@@ -147,7 +147,10 @@ func main() {
 			}
 
 			return nil
-		})
+		}
+
+		b.Handle(tele.OnPhoto, forwardHandler)
+		b.Handle(tele.OnText, forwardHandler)
 	}
 
 	if err := b.SetCommands(botCommands); err != nil {
