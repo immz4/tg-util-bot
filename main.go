@@ -39,8 +39,7 @@ type Config struct {
 	} `koanf:"resend"`
 	Feedback struct {
 		Enabled bool    `koanf:"enabled"`
-		Command Command `koanf:"command" validate:"required_if=Enabled true"`
-		ChatId  string  `koanf:"chatId" validate:"required_if=Enabled true"`
+		To      []int64 `koanf:"to" validate:"required_if=Enabled true"`
 	} `koanf:"feedback"`
 }
 
@@ -129,6 +128,25 @@ func main() {
 		botCommands = append(botCommands, tele.Command{
 			Text:        config.Resend.Command.Text,
 			Description: config.Resend.Command.Description,
+		})
+	}
+
+	if config.Feedback.Enabled {
+		log.Println("Enabling feedback functionality")
+
+		b.Handle(tele.OnText, func(c tele.Context) error {
+			if c.Chat().Type == tele.ChatPrivate {
+				for _, toId := range config.Feedback.To {
+					target := ResendTarget(strconv.Itoa(int(toId)))
+					log.Println("Resend", c.Chat().ID, target)
+
+					if _, err := b.Forward(target, c.Message()); err != nil {
+						log.Println("Error during resend", err)
+					}
+				}
+			}
+
+			return nil
 		})
 	}
 
