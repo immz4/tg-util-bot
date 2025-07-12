@@ -28,19 +28,23 @@ type Command struct {
 	Description string `koanf:"description" validate:"required_if=Enabled true"`
 }
 
+type ResendConfig struct {
+	Enabled  bool     `koanf:"enabled"`
+	Command  Command  `koanf:"command" validate:"required_if=Enabled true"`
+	Keywords []string `koanf:"keywords"`
+	From     []int64  `koanf:"from" validate:"required_if=Enabled true"`
+	To       []int64  `koanf:"to" validate:"required_if=Enabled true"`
+}
+
+type FeedbackConfig struct {
+	Enabled bool    `koanf:"enabled"`
+	To      []int64 `koanf:"to" validate:"required_if=Enabled true"`
+}
+
 type Config struct {
-	Token  string `koanf:"token" validate:"required,len=46"`
-	Resend struct {
-		Enabled  bool     `koanf:"enabled"`
-		Command  Command  `koanf:"command" validate:"required_if=Enabled true"`
-		Keywords []string `koanf:"keywords"`
-		From     []int64  `koanf:"from" validate:"required_if=Enabled true"`
-		To       []int64  `koanf:"to" validate:"required_if=Enabled true"`
-	} `koanf:"resend"`
-	Feedback struct {
-		Enabled bool    `koanf:"enabled"`
-		To      []int64 `koanf:"to" validate:"required_if=Enabled true"`
-	} `koanf:"feedback"`
+	Token    string         `koanf:"token" validate:"required,len=46"`
+	Resend   ResendConfig   `koanf:"resend"`
+	Feedback FeedbackConfig `koanf:"feedback"`
 }
 
 var (
