@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"slices"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -15,6 +18,10 @@ import (
 	"github.com/knadh/koanf/providers/rawbytes"
 	"github.com/knadh/koanf/v2"
 	tele "gopkg.in/telebot.v4"
+)
+
+const (
+	DefaultPollTimeout = 10 * time.Second
 )
 
 type ResendTarget string
@@ -43,143 +50,260 @@ type FeedbackConfig struct {
 
 type Config struct {
 	Token    string         `koanf:"token" validate:"required,len=46"`
+	Port     string         `koanf:"port" validate:"required"`
 	Resend   ResendConfig   `koanf:"resend"`
 	Feedback FeedbackConfig `koanf:"feedback"`
 }
 
-var (
-	k        = koanf.New(".")
-	validate = validator.New(validator.WithRequiredStructEnabled())
-)
-
-func loadConfig(config string) Config {
-	if err := k.Load(rawbytes.Provider([]byte(config)), toml.Parser()); err != nil {
-		log.Fatalf("error loading config: %v", err)
-	}
-
-	var configData Config
-
-	if err := k.Unmarshal("", &configData); err != nil {
-		panic(err)
-	}
-
-	if err := validate.Struct(configData); err != nil {
-		panic(err)
-	}
-
-	return configData
+type App struct {
+	Config    Config
+	Bot       *tele.Bot
+	Validator *validator.Validate
+	Logger    *log.Logger
 }
 
-func main() {
-	config := loadConfig(os.Getenv("APP_CONFIG"))
-
-	// Health check endpoint
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "OK")
-	})
-
-	// Telegram bot setup
-	pref := tele.Settings{
-		Token:  config.Token,
-		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+func NewApp(configData string) (*App, error) {
+	app := &App{
+		Validator: validator.New(validator.WithRequiredStructEnabled()),
+		Logger:    log.New(os.Stdout, "[TG-BOT] ", log.LstdFlags),
 	}
 
-	b, err := tele.NewBot(pref)
+	if err := app.loadConfig(configData); err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	if err := app.initBot(); err != nil {
+		return nil, fmt.Errorf("failed to initialize bot: %w", err)
+	}
+
+	app.setupHandlers()
+	return app, nil
+}
+
+func (a *App) loadConfig(configData string) error {
+	k := koanf.New(".")
+
+	if err := k.Load(rawbytes.Provider([]byte(configData)), toml.Parser()); err != nil {
+		return fmt.Errorf("error parsing config: %w", err)
+	}
+
+	if err := k.Unmarshal("", &a.Config); err != nil {
+		return fmt.Errorf("error unmarshaling config: %w", err)
+	}
+
+	if err := a.Validator.Struct(a.Config); err != nil {
+		return fmt.Errorf("config validation failed: %w", err)
+	}
+
+	return nil
+}
+
+func (a *App) initBot() error {
+	settings := tele.Settings{
+		Token:  a.Config.Token,
+		Poller: &tele.LongPoller{Timeout: DefaultPollTimeout},
+	}
+
+	bot, err := tele.NewBot(settings)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed to create bot: %w", err)
 	}
 
-	var botCommands []tele.Command
+	a.Bot = bot
+	return nil
+}
 
-	b.Handle("/id", func(c tele.Context) error {
-		id := strconv.Itoa(int(c.Chat().ID))
-		log.Println("Got /id", id)
-		return c.Send(strconv.Itoa(int(c.Chat().ID)))
-	})
+func (a *App) setupHandlers() {
+	var commands []tele.Command
 
-	botCommands = append(botCommands, tele.Command{
+	a.Bot.Handle("/id", a.handleIDCommand)
+	commands = append(commands, tele.Command{
 		Text:        "/id",
 		Description: "Get ID of this chat",
 	})
 
-	if config.Resend.Enabled {
-		log.Println("Enabling resend functionality")
-
-		resendHandler := func(c tele.Context) error {
-			log.Println("Got resend", c.Chat().ID)
-
-			if c.Message().IsReply() && slices.Contains(config.Resend.From, c.Chat().ID) {
-				for _, toId := range config.Resend.To {
-					target := ResendTarget(strconv.Itoa(int(toId)))
-					log.Println("Resend", c.Chat().ID, target)
-
-					if _, err := b.Forward(target, c.Message().ReplyTo); err != nil {
-						log.Println("Error during resend", err)
-					}
-				}
-			}
-			return nil
-		}
-
-		// Listen to the registered command
-		b.Handle(config.Resend.Command.Text, resendHandler)
-
-		// Listen to the keywords
-		for _, keyword := range config.Resend.Keywords {
-			b.Handle(keyword, resendHandler)
-		}
-
-		botCommands = append(botCommands, tele.Command{
-			Text:        config.Resend.Command.Text,
-			Description: config.Resend.Command.Description,
+	if a.Config.Resend.Enabled {
+		a.Logger.Println("Enabling resend functionality")
+		a.setupResendHandlers()
+		commands = append(commands, tele.Command{
+			Text:        a.Config.Resend.Command.Text,
+			Description: a.Config.Resend.Command.Description,
 		})
 	}
 
-	if config.Feedback.Enabled {
-		log.Println("Enabling feedback functionality")
+	if a.Config.Feedback.Enabled {
+		a.Logger.Println("Enabling feedback functionality")
+		a.setupFeedbackHandlers()
+	}
 
-		forwardHandler := func(c tele.Context) error {
-			if c.Chat().Type == tele.ChatPrivate {
-				for _, toId := range config.Feedback.To {
-					target := ResendTarget(strconv.Itoa(int(toId)))
-					log.Println("Resend", c.Chat().ID, target)
+	if err := a.Bot.SetCommands(commands); err != nil {
+		a.Logger.Printf("Failed to set commands: %v", err)
+	}
+}
 
-					if _, err := b.Forward(target, c.Message()); err != nil {
-						log.Println("Error during resend", err)
-					}
-				}
-			}
+func (a *App) handleIDCommand(c tele.Context) error {
+	chatID := c.Chat().ID
+	a.Logger.Printf("Received /id command from chat %d", chatID)
+	return c.Send(strconv.FormatInt(chatID, 10))
+}
 
+func (a *App) setupResendHandlers() {
+	handler := a.createResendHandler()
+
+	a.Bot.Handle(a.Config.Resend.Command.Text, handler)
+
+	for _, keyword := range a.Config.Resend.Keywords {
+		a.Bot.Handle(keyword, handler)
+	}
+}
+
+func (a *App) createResendHandler() tele.HandlerFunc {
+	return func(c tele.Context) error {
+		chatID := c.Chat().ID
+		a.Logger.Printf("Received resend request from chat %d", chatID)
+
+		if !c.Message().IsReply() || !slices.Contains(a.Config.Resend.From, chatID) {
 			return nil
 		}
 
-		b.Handle(tele.OnPhoto, forwardHandler)
-		b.Handle(tele.OnText, forwardHandler)
+		for _, targetID := range a.Config.Resend.To {
+			target := ResendTarget(strconv.FormatInt(targetID, 10))
+			a.Logger.Printf("Forwarding message from chat %d to %s", chatID, target)
+
+			if _, err := a.Bot.Forward(target, c.Message().ReplyTo); err != nil {
+				a.Logger.Printf("Failed to forward message to %s: %v", target, err)
+			}
+		}
+
+		return nil
+	}
+}
+
+func (a *App) setupFeedbackHandlers() {
+	handler := a.createFeedbackHandler()
+	a.Bot.Handle(tele.OnPhoto, handler)
+	a.Bot.Handle(tele.OnText, handler)
+}
+
+func (a *App) createFeedbackHandler() tele.HandlerFunc {
+	return func(c tele.Context) error {
+		if c.Chat().Type != tele.ChatPrivate {
+			return nil
+		}
+
+		chatID := c.Chat().ID
+		a.Logger.Printf("Received feedback from private chat %d", chatID)
+
+		for _, targetID := range a.Config.Feedback.To {
+			target := ResendTarget(strconv.FormatInt(targetID, 10))
+			a.Logger.Printf("Forwarding feedback from chat %d to %s", chatID, target)
+
+			if _, err := a.Bot.Forward(target, c.Message()); err != nil {
+				a.Logger.Printf("Failed to forward feedback to %s: %v", target, err)
+			}
+		}
+
+		return nil
+	}
+}
+
+func (a *App) startHTTPServer(ctx context.Context) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	})
+
+	port := a.Config.Port
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
 	}
 
-	if err := b.SetCommands(botCommands); err != nil {
-		log.Fatal(err)
+	a.Logger.Printf("Starting HTTP server on port %s", port)
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			a.Logger.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	a.Logger.Println("Shutting down HTTP server...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	return server.Shutdown(shutdownCtx)
+}
+
+func (a *App) startTelegramBot(ctx context.Context) error {
+	a.Logger.Println("Starting Telegram bot...")
+
+	go a.Bot.Start()
+
+	<-ctx.Done()
+	a.Logger.Println("Stopping Telegram bot...")
+	a.Bot.Stop()
+
+	return nil
+}
+
+func (a *App) Run() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := a.startHTTPServer(ctx); err != nil {
+			errChan <- fmt.Errorf("HTTP server error: %w", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := a.startTelegramBot(ctx); err != nil {
+			errChan <- fmt.Errorf("telegram bot error: %w", err)
+		}
+	}()
+
+	select {
+	case sig := <-sigChan:
+		a.Logger.Printf("Received signal %v, shutting down...", sig)
+		cancel()
+	case err := <-errChan:
+		a.Logger.Printf("Error occurred: %v", err)
+		cancel()
+		return err
 	}
-
-	// Starting the app
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-
-		log.Println("Starting HTTP server")
-		log.Fatal(http.ListenAndServe(":3000", nil))
-	}()
-
-	go func() {
-		defer wg.Done()
-
-		log.Println("Starting Telegram bot")
-		b.Start()
-	}()
 
 	wg.Wait()
+	a.Logger.Println("Application stopped successfully")
+	return nil
+}
 
-	fmt.Println("a gde)")
+func main() {
+	configData := os.Getenv("APP_CONFIG")
+	if configData == "" {
+		log.Fatal("APP_CONFIG env variable is required")
+	}
+
+	app, err := NewApp(configData)
+	if err != nil {
+		log.Fatalf("failed to create application: %v", err)
+	}
+
+	if err := app.Run(); err != nil {
+		log.Fatalf("Application error: %v", err)
+	}
 }
